@@ -4,9 +4,11 @@ import streamlit as st
 # --- Optional: DB (won't crash if not set) ---
 USE_DB = all(os.getenv(k) for k in ["PGHOST","PGUSER","PGPASSWORD","PGDATABASE"])
 if USE_DB:
-    import os, psycopg2
-    def db_conn():
-        return psycopg2.connect(os.getenv("DATABASE_URL"))
+    import os
+import psycopg2
+
+def db_conn():
+    return psycopg2.connect(os.getenv("DATABASE_URL"))
             host=os.getenv("PGHOST"),
             user=os.getenv("PGUSER"),
             password=os.getenv("PGPASSWORD"),
