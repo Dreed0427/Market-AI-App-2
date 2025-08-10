@@ -7,60 +7,36 @@ import streamlit as st
 import httpx
 from bs4 import BeautifulSoup
 
-# ---------------- Config / Env ----------------
+# =================== Config ===================
 REFRESH_MS = int(os.getenv("REFRESH_MS", "60000"))  # auto-refresh every 60s
-USE_DB = bool(os.getenv("DATABASE_URL"))
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-FINNHUB_KEY = os.getenv("FINNHUB_KEY")  # optional (stocks)
-FRED_KEY = os.getenv("FRED_KEY")        # optional (macro)
-UA_EMAIL = "priestndgo@gmail.com"       # your email for polite User-Agent
+DATABASE_URL = os.getenv("DATABASE_URL")
+OPENAI_KEY   = os.getenv("OPENAI_API_KEY")          # optional
+FINNHUB_KEY  = os.getenv("FINNHUB_KEY")             # optional
+FRED_KEY     = os.getenv("FRED_KEY")                # optional
+UA_EMAIL     = "priestndgo@gmail.com"
 
+USE_DB = bool(DATABASE_URL)
 if USE_DB:
-    import psycopg2  # Postgres driver
+    import psycopg2
 
 st.set_page_config(page_title="Market AI", page_icon="📈", layout="centered")
+
 st.markdown(
     "<h1 style='margin-bottom:0'>📈 Market AI</h1>"
-    "<p style='color:#9aa0a6;margin-top:2px'>Phone-friendly market dashboard</p>",
+    "<p style='color:#444;margin-top:2px'>Stocks · Crypto · Macro · Institutional</p>",
     unsafe_allow_html=True,
 )
-# Auto-refresh (simple JS)
 st.markdown(
     f"<script>setTimeout(()=>window.location.reload(), {REFRESH_MS});</script>",
     unsafe_allow_html=True,
 )
 
-# ---------------- DB helpers ----------------
+# =================== DB helpers ===================
 def db_conn():
     if not USE_DB: return None
-    return psycopg2.connect(os.getenv("DATABASE_URL"), connect_timeout=10)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
-def ensure_table():
-    if not USE_DB: return
-    with db_conn() as cn, cn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS market_bars(
-          id SERIAL PRIMARY KEY,
-          symbol TEXT NOT NULL,
-          ts TIMESTAMP NOT NULL,
-          open NUMERIC, high NUMERIC, low NUMERIC, close NUMERIC, volume NUMERIC
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_bars_symbol_ts
-          ON market_bars(symbol, ts);
-        """)
-        cn.commit()
-
-def save_rows(symbol, rows):  # rows list[(ts, price)]
-    if not USE_DB or not rows: return
-    with db_conn() as cn, cn.cursor() as cur:
-        cur.executemany("""
-            INSERT INTO market_bars(symbol, ts, open, high, low, close, volume)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (symbol, ts) DO UPDATE SET close=EXCLUDED.close;
-        """, [(symbol, ts, float(p), float(p), float(p), float(p), 0) for ts, p in rows])
-        cn.commit()
-
-# ---------------- Crypto (CoinGecko, no key) ----------------
+# =================== Crypto (CoinGecko) ===================
 @st.cache_data(ttl=60)
 def coingecko_series(asset_id: str, days: int):
     url = f"https://api.coingecko.com/api/v3/coins/{asset_id}/market_chart"
@@ -76,7 +52,7 @@ def coingecko_series(asset_id: str, days: int):
     df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms")
     return df[["ts", "price"]]
 
-# ---------------- Stocks (Finnhub) ----------------
+# =================== Stocks (Finnhub) ===================
 @st.cache_data(ttl=30)
 def finnhub_quote(symbol: str):
     if not FINNHUB_KEY: return None
@@ -99,7 +75,7 @@ def finnhub_candles(symbol: str, days: int):
     if not FINNHUB_KEY: return None
     now = int(datetime.utcnow().timestamp())
     frm = int((datetime.utcnow() - timedelta(days=days)).timestamp())
-    res = "5" if days <= 7 else "60"  # 5-min for <=7d, hourly otherwise
+    res = "5" if days <= 7 else "60"
     r = requests.get(
         "https://finnhub.io/api/v1/stock/candle",
         params={"symbol": symbol.upper(), "resolution": res, "from": frm, "to": now, "token": FINNHUB_KEY},
@@ -133,7 +109,7 @@ def finnhub_company_news(symbol: str):
         })
     return out
 
-# ---------------- Macro (FRED) ----------------
+# =================== Macro (FRED) ===================
 @st.cache_data(ttl=3600)
 def fred_series(series_id: str):
     if not FRED_KEY: return None
@@ -156,9 +132,9 @@ def fred_cpi_yoy():
     df["yoy"] = df["value"].pct_change(12) * 100
     return df[["date", "yoy"]].dropna()
 
-# ---------------- Institutional: BTC ETF flows (Farside) ----------------
-@st.cache_data(ttl=60 * 30)  # 30 min
-def btc_etf_flows():
+# =================== Institutional (flows + SEC) ===================
+@st.cache_data(ttl=60 * 30)
+def btc_etf_flows_live():
     url = "https://www.farside.co.uk/bitcoin-etf-flows"
     headers = {"User-Agent": f"MarketAI/1.0 ({UA_EMAIL})"}
     r = httpx.get(url, headers=headers, timeout=20)
@@ -166,14 +142,12 @@ def btc_etf_flows():
     soup = BeautifulSoup(r.text, "html.parser")
     table = soup.find("table")
     if not table: return None
-
     rows = []
     for tr in table.find_all("tr"):
         cols = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
         if len(cols) < 3 or "fund" in cols[0].lower():  # skip header
             continue
         rows.append(cols)
-
     parsed = []
     for cols in rows:
         try:
@@ -184,9 +158,8 @@ def btc_etf_flows():
             continue
     return parsed[:60]
 
-# ---------------- Institutional: SEC search ----------------
-@st.cache_data(ttl=60 * 10)  # 10 min
-def sec_search(query="bitcoin OR digital asset", forms=("8-K", "13F-HR", "13D", "13G"), size=20):
+@st.cache_data(ttl=60 * 10)
+def sec_search_live(query="bitcoin OR digital asset", forms=("8-K", "13F-HR", "13D", "13G"), size=20):
     url = "https://efts.sec.gov/LATEST/search-index"
     headers = {
         "User-Agent": f"MarketAI/1.0 ({UA_EMAIL})",
@@ -215,9 +188,10 @@ def sec_search(query="bitcoin OR digital asset", forms=("8-K", "13F-HR", "13D", 
     except Exception:
         return None
 
-# ---------------- UI ----------------
-tab1, tab2, tab3, tab4 = st.tabs(["Crypto", "Stocks & Macro", "AI Summary", "Institutional"])
+# =================== UI ===================
+tab1, tab2, tab3, tab4 = st.tabs(["Crypto", "Stocks & Macro", "AI", "Institutional"])
 
+# ---- Crypto
 with tab1:
     left, right = st.columns([2, 1])
     with left:
@@ -234,16 +208,10 @@ with tab1:
         k2.metric("Points", f"{len(dfc)}")
         st.line_chart(dfc.set_index("ts")["price"])
         st.caption("Source: CoinGecko (cached 60s)")
+    else:
+        st.warning("No data from CoinGecko.")
 
-        # Save last points to DB quietly
-        try:
-            ensure_table()
-            recent = [(row.ts, float(row.price)) for row in dfc.tail(30).itertuples(index=False)]
-            save_rows(asset.upper()[:3], recent)
-            if USE_DB: st.caption("DB: recent crypto rows saved ✅")
-        except Exception as e:
-            st.caption(f"DB note: {e}")
-
+# ---- Stocks & Macro
 with tab2:
     st.subheader("Stocks")
     tick = st.text_input("Ticker (e.g., SPY, AAPL, TSLA)", value="SPY").upper().strip()
@@ -259,18 +227,12 @@ with tab2:
         if q["time"]:
             colB.write(f"Time (UTC): {q['time']}")
     else:
-        st.caption("Add FINNHUB_KEY to enable stock quotes/candles.")
+        st.info("Add FINNHUB_KEY in Variables to enable stock quotes/candles.")
 
     if c is not None and not c.empty:
         st.line_chart(c.set_index("ts")["price"])
     else:
         st.caption("No candles (rate limit or bad ticker).")
-
-    news = finnhub_company_news(tick)
-    if news:
-        st.write("Latest headlines:")
-        for n in news:
-            st.write(f"- {n['dt']} — [{n['headline']}]({n['url']})")
 
     st.subheader("Macro")
     cpi = fred_cpi_yoy()
@@ -292,6 +254,7 @@ with tab2:
         st.line_chart(dgs10.tail(180).set_index("date")["value"])
         st.caption("10Y Treasury yield (last ~6 months)")
 
+# ---- AI
 with tab3:
     if OPENAI_KEY:
         try:
@@ -301,7 +264,7 @@ with tab3:
             prompt = (
                 "Give 5 concise bullets on crypto & equities today, using these BTC time/price points: "
                 f"{brief}. Mention CPI trend, yield curve slope, and any effect on risk assets. "
-                "Be simple and neutral."
+                "Keep it neutral, punchy, and clear."
             )
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -312,30 +275,62 @@ with tab3:
         except Exception as e:
             st.caption(f"AI summary unavailable: {e}")
     else:
-        st.caption("Tip: add OPENAI_API_KEY in Railway → Variables to enable AI summaries.")
+        st.caption("Tip: add OPENAI_API_KEY in Variables to enable AI summaries.")
 
+# ---- Institutional
 with tab4:
     st.subheader("BTC Spot ETF flows (daily)")
-    flows = btc_etf_flows()
-    if flows:
+    # DB view (persisted by worker)
+    if USE_DB:
         try:
-            last_date = flows[0]["date"]
-            day_total = sum(x["flow_musd"] for x in flows if x["date"] == last_date)
-            st.metric(f"Net flow on {last_date}", f"${day_total:.1f}M")
-        except Exception:
-            pass
-        df_flows = pd.DataFrame(flows)
-        st.dataframe(df_flows.head(20))
-        st.caption("Source: Farside (scraped; cached 30 min)")
-    else:
-        st.caption("Couldn’t read the Farside table (layout may have changed).")
+            with db_conn() as cn:
+                df_db = pd.read_sql_query(
+                    "SELECT date, fund, flow_musd FROM etf_flows ORDER BY date DESC, fund ASC LIMIT 60", cn
+                )
+            if len(df_db):
+                last_date = df_db["date"].iloc[0]
+                day_total = float(df_db[df_db["date"] == last_date]["flow_musd"].sum())
+                st.metric(f"Net flow on {last_date}", f"${day_total:.1f}M")
+                st.dataframe(df_db.head(30))
+                st.caption("From DB (persisted).")
+            else:
+                st.caption("No ETF flows in DB yet.")
+        except Exception as e:
+            st.caption(f"DB read issue: {e}")
+
+    # live fallback
+    live = btc_etf_flows_live()
+    if live:
+        st.write("Latest (live):")
+        st.dataframe(pd.DataFrame(live).head(15))
+        st.caption("Live source: Farside (cached 30 min)")
 
     st.markdown("---")
     st.subheader("Recent SEC filings mentioning crypto")
-    qtext = st.text_input("Keyword(s)", value="bitcoin OR digital asset")
+    if USE_DB:
+        try:
+            with db_conn() as cn:
+                df_fil = pd.read_sql_query(
+                    "SELECT filed_at, form, company, title, link FROM sec_filings ORDER BY filed_at DESC NULLS LAST LIMIT 25",
+                    cn
+                )
+            if len(df_fil):
+                for _, r in df_fil.iterrows():
+                    filed = str(r["filed_at"])[:10] if r["filed_at"] else ""
+                    if r["link"]:
+                        st.write(f"- **{filed} · {r['form']}** — {r['company']}: [{r['title']}]({r['link']})")
+                    else:
+                        st.write(f"- **{filed} · {r['form']}** — {r['company']}: {r['title']}")
+                st.caption("From DB (persisted).")
+            else:
+                st.caption("No filings in DB yet.")
+        except Exception as e:
+            st.caption(f"DB read issue: {e}")
+
+    qtext = st.text_input("Live scan keywords", value="bitcoin OR digital asset")
     forms = st.multiselect("Forms", options=["8-K", "13F-HR", "13D", "13G"], default=["8-K", "13F-HR"])
-    if st.button("Scan SEC", use_container_width=True):
-        results = sec_search(qtext, tuple(forms))
+    if st.button("Scan SEC now", use_container_width=True):
+        results = sec_search_live(qtext, tuple(forms))
         if results:
             for r in results[:15]:
                 filed = r["filedAt"][:10] if r.get("filedAt") else ""
@@ -346,6 +341,6 @@ with tab4:
                     st.write(f"- **{filed} · {r['form']}** — {company}: [{title}]({link})")
                 else:
                     st.write(f"- **{filed} · {r['form']}** — {company}: {title}")
-            st.caption("Source: SEC full-text search (cached 10 min)")
+            st.caption("Live from SEC (cached ~10 min).")
         else:
             st.caption("No results or rate-limited. Try simpler keywords.")
