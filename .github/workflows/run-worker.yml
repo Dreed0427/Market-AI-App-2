@@ -1,0 +1,50 @@
+name: Run Railway Worker (no service id)
+
+on:
+  workflow_dispatch: {}   # we trigger this from your iPhone
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+      SERVICE_NAME: web            # <- change to your service's name if needed
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq + curl
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Get Service ID from Railway (by name)
+        id: find
+        run: |
+          Q='query($pid:ID!){ project(id:$pid){ services{ id name } } }'
+          RESP=$(curl -s https://backboard.railway.app/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"query\":\"$Q\",\"variables\":{\"pid\":\"$RAILWAY_PROJECT_ID\"}}")
+
+          echo "Raw: $RESP"
+          SID=$(echo "$RESP" | jq -r --arg NAME "$SERVICE_NAME" '.data.project.services[] | select(.name==$NAME) | .id')
+          if [ -z "$SID" ] || [ "$SID" = "null" ]; then
+            echo "Could not find service named $SERVICE_NAME"; exit 1
+          fi
+          echo "service_id=$SID" >> $GITHUB_OUTPUT
+
+      - name: Setup Node (Railway CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Railway CLI
+        run: npm i -g @railway/cli
+
+      - name: Trigger deploy
+        env:
+          SERVICE_ID: ${{ steps.find.outputs.service_id }}
+        run: |
+          railway link --project "$RAILWAY_PROJECT_ID" --service "$SERVICE_ID"
+          # This runs your Start Command (python worker.py) on Railway
+          railway deploy --yes
