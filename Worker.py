@@ -1,3 +1,8 @@
+# worker.py — single-file background ingestor + Slack alerts
+# Creates tables automatically; ingests CoinGecko (BTC/ETH), Farside BTC ETF flows,
+# SEC filings (EFTS), Finnhub bars+news (if FINNHUB_KEY), FRED series (if FRED_KEY).
+# Sends Slack alerts for big ETF net flows, latest SEC hits, and a run summary.
+
 import os, json, time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Iterable
@@ -6,39 +11,31 @@ import requests, httpx, pandas as pd, psycopg2
 from psycopg2.extras import Json
 from bs4 import BeautifulSoup
 
-# ==============================
-# ENV / KNOBS
-# ==============================
+# =========================
+# ENV / SETTINGS
+# =========================
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise SystemExit("DATABASE_URL is not set")
 
-UA_EMAIL       = "priestndgo@gmail.com"
-UA_HDRS        = {"User-Agent": f"MarketAI/1.0 ({UA_EMAIL})"}
+UA_EMAIL   = "priestndgo@gmail.com"
+UA_HDRS    = {"User-Agent": f"MarketAI/1.0 ({UA_EMAIL})"}
 
-# Alerts (optional)
-WEBHOOK_URL     = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL  = os.getenv("WEBHOOK_URL")             # Slack Incoming Webhook URL (optional)
+FINNHUB_KEY  = os.getenv("FINNHUB_KEY")             # optional
+FRED_KEY     = os.getenv("FRED_KEY")                # optional
+
 FLOW_ALERT_MUSD = float(os.getenv("FLOW_ALERT_MUSD", "500"))
+SEC_KEYWORDS    = os.getenv("SEC_KEYWORDS", "bitcoin OR digital asset")
+SEC_FORMS       = [s.strip() for s in os.getenv("SEC_FORMS", "8-K,13F-HR,13D,13G").split(",") if s.strip()]
+FINNHUB_TICKERS = [s.strip().upper() for s in os.getenv("FINNHUB_TICKERS", "SPY,AAPL,TSLA,QQQ,MSFT").split(",") if s.strip()]
+FRED_SERIES     = [s.strip() for s in os.getenv("FRED_SERIES", "CPIAUCSL,DGS2,DGS10,UNRATE").split(",") if s.strip()]
 
-# SEC scan
-SEC_KEYWORDS = os.getenv("SEC_KEYWORDS", "bitcoin OR digital asset")
-SEC_FORMS    = [x.strip() for x in os.getenv("SEC_FORMS", "8-K,13F-HR,13D,13G").split(",") if x.strip()]
+HTTP_TIMEOUT = 20
 
-# Finnhub / FRED
-FINNHUB_KEY = os.getenv("FINNHUB_KEY")  # optional but used if present
-FRED_KEY    = os.getenv("FRED_KEY")     # optional but used if present
-
-# Choose what to pull
-FINNHUB_TICKERS: Iterable[str] = os.getenv("FINNHUB_TICKERS", "SPY,AAPL,TSLA,QQQ,MSFT").split(",")
-FRED_SERIES:    Iterable[str] = os.getenv("FRED_SERIES", "CPIAUCSL,DGS2,DGS10,UNRATE").split(",")
-
-# HTTP
-HTTP_TIMEOUT = 20  # seconds
-
-
-# ==============================
+# =========================
 # DB HELPERS
-# ==============================
+# =========================
 def conn(): return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
 def ensure_schema():
@@ -101,7 +98,7 @@ def upsert_bar(symbol: str, ts: datetime, price: float):
         cur.execute("""
         INSERT INTO market_bars(symbol, ts, open, high, low, close, volume)
         VALUES (%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT (symbol, ts) DO UPDATE SET close = EXCLUDED.close;
+        ON CONFLICT (symbol, ts) DO UPDATE SET close=EXCLUDED.close;
         """, (symbol, ts, price, price, price, price, 0)); cn.commit()
 
 def upsert_flow(date_s: str, fund: str, flow_musd: float):
@@ -109,7 +106,7 @@ def upsert_flow(date_s: str, fund: str, flow_musd: float):
         cur.execute("""
         INSERT INTO etf_flows(date, fund, flow_musd)
         VALUES (%s,%s,%s)
-        ON CONFLICT (date, fund) DO UPDATE SET flow_musd = EXCLUDED.flow_musd;
+        ON CONFLICT (date, fund) DO UPDATE SET flow_musd=EXCLUDED.flow_musd;
         """, (date_s, fund, float(flow_musd))); cn.commit()
 
 def insert_filing(filed_at_iso: str|None, form: str|None, company: str|None, title: str|None, link: str|None):
@@ -129,7 +126,7 @@ def upsert_fred(series_id: str, date_str: str, value: float|None):
         cur.execute("""
         INSERT INTO fred_series(series_id, date, value)
         VALUES (%s,%s,%s)
-        ON CONFLICT (series_id, date) DO UPDATE SET value = EXCLUDED.value;
+        ON CONFLICT (series_id, date) DO UPDATE SET value=EXCLUDED.value;
         """, (series_id, date_str, value)); cn.commit()
 
 def insert_news(source: str, symbol: str, dt: datetime|None, headline: str|None, url: str|None):
@@ -143,15 +140,27 @@ def log_alert(kind: str, payload: Dict[str, Any]):
     with conn() as cn, cn.cursor() as cur:
         cur.execute("INSERT INTO alerts(kind, payload) VALUES (%s,%s)", (kind, Json(payload))); cn.commit()
 
-def webhook(text: str):
+# =========================
+# SLACK HELPERS
+# =========================
+def slack(text: str, blocks: list|None=None):
     if not WEBHOOK_URL: return
-    try: httpx.post(WEBHOOK_URL, json={"text": text}, timeout=10)
-    except Exception: pass
+    try:
+        payload = {"text": text}
+        if blocks: payload["blocks"] = blocks
+        httpx.post(WEBHOOK_URL, json=payload, timeout=10)
+    except Exception:
+        pass
 
+def slack_section(md: str) -> Dict[str, Any]:
+    return {"type":"section","text":{"type":"mrkdwn","text": md}}
 
-# ==============================
+def slack_divider() -> Dict[str, Any]:
+    return {"type":"divider"}
+
+# =========================
 # DATA SOURCES
-# ==============================
+# =========================
 def coingecko_prices(coin: str, days: int = 1):
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart"
@@ -203,13 +212,13 @@ def farside_btc_flows() -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-def sec_search():
-    url = "https://efts.sec.gov/LATEST/search-index"
+def sec_search() -> List[Dict[str, Any]]:
+    url = "https://efts.sec.gov/LATEST/search-index"  # EDGAR Full-Text Search
     forms_q = " OR ".join([f'formType:\"{f}\"' for f in SEC_FORMS]) if SEC_FORMS else ""
     keys = f'({SEC_KEYWORDS}) AND ({forms_q})' if forms_q else f'({SEC_KEYWORDS})'
     payload = {"keys": keys, "category": "custom", "from": 0, "size": 40, "sort": [{"filedAt":{"order":"desc"}}]}
     try:
-        resp = httpx.post(url, headers={**UA_HDRS, "Accept":"application/json","Content-Type":"application/json"},
+        resp = httpx.post(url, headers={**UA_HDRS,"Accept":"application/json","Content-Type":"application/json"},
                           json=payload, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200: return []
         hits = resp.json().get("hits", {}).get("hits", [])
@@ -228,33 +237,28 @@ def sec_search():
     except Exception:
         return []
 
-# ---------- FINNHUB ----------
-def finnhub_quote(symbol: str) -> Dict[str, Any] | None:
+# ---- Finnhub ----
+def finnhub_quote(symbol: str):
     if not FINNHUB_KEY: return None
     try:
         r = requests.get("https://finnhub.io/api/v1/quote",
-                         params={"symbol": symbol, "token": FINNHUB_KEY},
+                         params={"symbol":symbol,"token":FINNHUB_KEY},
                          headers=UA_HDRS, timeout=HTTP_TIMEOUT)
         if not r.ok: return None
         j = r.json()
         return {"c": j.get("c"), "pc": j.get("pc"), "t": j.get("t")}
-    except Exception:
-        return None
+    except Exception: return None
 
-def finnhub_candles(symbol: str, frm: int, to: int, res: str = "5") -> pd.DataFrame | None:
+def finnhub_candles(symbol: str, frm: int, to: int, res: str="5") -> pd.DataFrame|None:
     if not FINNHUB_KEY: return None
     try:
         r = requests.get("https://finnhub.io/api/v1/stock/candle",
-                         params={"symbol": symbol, "resolution": res, "from": frm, "to": to, "token": FINNHUB_KEY},
+                         params={"symbol":symbol,"resolution":res,"from":frm,"to":to,"token":FINNHUB_KEY},
                          headers=UA_HDRS, timeout=HTTP_TIMEOUT)
         j = r.json()
         if j.get("s") != "ok": return None
-        return pd.DataFrame({
-            "ts": [datetime.utcfromtimestamp(t) for t in j["t"]],
-            "close": j["c"]
-        })
-    except Exception:
-        return None
+        return pd.DataFrame({"ts":[datetime.utcfromtimestamp(t) for t in j["t"]], "close": j["c"]})
+    except Exception: return None
 
 def finnhub_news(symbol: str) -> List[Dict[str, Any]]:
     if not FINNHUB_KEY: return []
@@ -262,40 +266,37 @@ def finnhub_news(symbol: str) -> List[Dict[str, Any]]:
         to = datetime.utcnow().date()
         frm = to - timedelta(days=3)
         r = requests.get("https://finnhub.io/api/v1/company-news",
-                         params={"symbol": symbol, "from": frm.isoformat(), "to": to.isoformat(), "token": FINNHUB_KEY},
+                         params={"symbol":symbol,"from":frm.isoformat(),"to":to.isoformat(),"token":FINNHUB_KEY},
                          headers=UA_HDRS, timeout=HTTP_TIMEOUT)
         if not r.ok: return []
         out = []
         for i in r.json()[:10]:
             dt = datetime.utcfromtimestamp(i["datetime"]) if i.get("datetime") else None
-            out.append({"symbol": symbol, "dt": dt, "headline": i.get("headline"), "url": i.get("url")})
+            out.append({"symbol":symbol,"dt":dt,"headline":i.get("headline"),"url":i.get("url")})
         return out
-    except Exception:
-        return []
+    except Exception: return []
 
-# ---------- FRED ----------
+# ---- FRED ----
 def fred_fetch(series_id: str) -> List[Dict[str, Any]]:
     if not FRED_KEY: return []
     try:
         r = requests.get("https://api.stlouisfed.org/fred/series/observations",
-                         params={"series_id": series_id, "file_type":"json", "api_key": FRED_KEY},
+                         params={"series_id":series_id,"file_type":"json","api_key":FRED_KEY},
                          headers=UA_HDRS, timeout=HTTP_TIMEOUT)
         if not r.ok: return []
         obs = r.json().get("observations", [])
         out = []
-        for o in obs[-240:]:  # last ~20 years monthly-ish
+        for o in obs[-240:]:
             val = o.get("value")
             try: val_num = float(val)
             except Exception: val_num = None
-            out.append({"series_id": series_id, "date": o.get("date"), "value": val_num})
+            out.append({"series_id":series_id,"date":o.get("date"),"value":val_num})
         return out
-    except Exception:
-        return []
+    except Exception: return []
 
-
-# ==============================
+# =========================
 # TASKS
-# ==============================
+# =========================
 def task_crypto():
     ok1, m1 = coingecko_prices("bitcoin", 1)
     ok2, m2 = coingecko_prices("ethereum", 1)
@@ -306,30 +307,44 @@ def task_etf_flows():
     dates = set()
     for r in rows:
         upsert_flow(r["date"], r["fund"], r["flow_musd"]); dates.add(r["date"])
+    alert_text = None
     if dates:
         latest = sorted(dates)[-1]
         with conn() as cn:
             df = pd.read_sql_query("SELECT SUM(flow_musd) total FROM etf_flows WHERE date=%s", cn, params=(latest,))
         net = float(df["total"].iloc[0] or 0.0)
         if abs(net) >= FLOW_ALERT_MUSD:
-            webhook(f"BTC ETF net flow on {latest}: ${net:.1f}M")
+            arrow = "🟢" if net > 0 else "🔴"
+            alert_text = f"{arrow} *BTC ETF net flow* on *{latest}*: *${net:.1f}M*"
+            slack(alert_text)
             log_alert("etf_net_flow", {"date": latest, "net_musd": net})
-    return True, f"etf rows upserted: {len(rows)}"
+    return True, f"etf rows upserted: {len(rows)}" + (f" | ALERT: {alert_text}" if alert_text else "")
 
 def task_sec():
     items = sec_search()
     for it in items:
         insert_filing(it.get("filedAt"), it.get("form"), it.get("company"), it.get("title"), it.get("link"))
+    if items and WEBHOOK_URL:
+        top = items[:5]
+        blocks = [slack_section("*🗂️ Latest SEC filings mentioning crypto*"), slack_divider()]
+        for it in top:
+            filed = (it.get("filedAt") or "")[:10]
+            title = it.get("title") or ""
+            comp  = it.get("company") or ""
+            form  = it.get("form") or ""
+            link  = it.get("link")
+            line  = f"*{filed} · {form}* — *{comp}*\n<{link}|{title}>" if link else f"*{filed} · {form}* — *{comp}*\n{title}"
+            blocks.append(slack_section(line))
+        slack("SEC crypto filings update", blocks)
     return True, f"sec filings ingested: {len(items)}"
 
 def task_finnhub():
-    """Upsert candles/latest price and news for a small ticker set."""
     if not FINNHUB_KEY:
         return True, "finnhub skipped (no key)"
     to = int(datetime.utcnow().timestamp())
     frm = int((datetime.utcnow() - timedelta(days=2)).timestamp())
     total_rows, total_news = 0, 0
-    for sym in [s.strip().upper() for s in FINNHUB_TICKERS if s.strip()]:
+    for sym in FINNHUB_TICKERS:
         df = finnhub_candles(sym, frm, to, res="5")
         if df is None or df.empty:
             q = finnhub_quote(sym)
@@ -340,28 +355,23 @@ def task_finnhub():
             for _, r in df.iterrows():
                 upsert_bar(sym, r["ts"], float(r["close"]))
             total_rows += len(df)
-
-        # News
-        news_items = finnhub_news(sym)
-        for n in news_items:
+        for n in finnhub_news(sym):
             insert_news("finnhub", sym, n["dt"], n["headline"], n["url"])
-        total_news += len(news_items)
+            total_news += 1
     return True, f"finnhub bars: {total_rows}, news: {total_news}"
 
 def task_fred():
     if not FRED_KEY:
         return True, "fred skipped (no key)"
     rows = 0
-    for sid in [s.strip() for s in FRED_SERIES if s.strip()]:
-        obs = fred_fetch(sid)
-        for o in obs:
+    for sid in FRED_SERIES:
+        for o in fred_fetch(sid):
             upsert_fred(sid, o["date"], o["value"]); rows += 1
     return True, f"fred rows upserted: {rows}"
 
-
-# ==============================
+# =========================
 # MAIN
-# ==============================
+# =========================
 if __name__ == "__main__":
     started = time.time()
     ensure_schema()
@@ -379,6 +389,12 @@ if __name__ == "__main__":
         "duration_s": round(time.time()-started, 2),
         "results": results,
     }
-    try: log_alert("worker_summary", summary)
-    except Exception: pass
+    try:
+        log_alert("worker_summary", summary)
+        if WEBHOOK_URL:
+            lines = [("✅" if ok else "❌") + " " + msg for ok, msg in results]
+            slack(f"*Market AI — worker summary*  _(took {summary['duration_s']}s)_\n" + "\n".join(lines))
+    except Exception:
+        pass
+
     print("Worker summary:", json.dumps(summary, indent=2))
