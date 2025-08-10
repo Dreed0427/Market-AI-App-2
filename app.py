@@ -7,12 +7,13 @@ import streamlit as st
 import httpx
 from bs4 import BeautifulSoup
 
-# =================== Config ===================
-REFRESH_MS = int(os.getenv("REFRESH_MS", "60000"))  # auto-refresh every 60s
+# ========= config =========
+REFRESH_MS = int(os.getenv("REFRESH_MS", "60000"))
 DATABASE_URL = os.getenv("DATABASE_URL")
-OPENAI_KEY   = os.getenv("OPENAI_API_KEY")          # optional
-FINNHUB_KEY  = os.getenv("FINNHUB_KEY")             # optional
-FRED_KEY     = os.getenv("FRED_KEY")                # optional
+OPENAI_KEY   = os.getenv("OPENAI_API_KEY")    # optional
+FINNHUB_KEY  = os.getenv("FINNHUB_KEY")       # optional
+FRED_KEY     = os.getenv("FRED_KEY")          # optional
+WEBHOOK_URL  = os.getenv("WEBHOOK_URL")       # optional (Slack/Discord)
 UA_EMAIL     = "priestndgo@gmail.com"
 
 USE_DB = bool(DATABASE_URL)
@@ -20,23 +21,19 @@ if USE_DB:
     import psycopg2
 
 st.set_page_config(page_title="Market AI", page_icon="📈", layout="centered")
-
 st.markdown(
-    "<h1 style='margin-bottom:0'>📈 Market AI</h1>"
-    "<p style='color:#444;margin-top:2px'>Stocks · Crypto · Macro · Institutional</p>",
+    "<h1 style='margin-bottom:0'>📈 Market AI — Phone Dashboard</h1>"
+    "<p style='color:#444;margin-top:2px'>Crypto · Stocks · Macro · Institutional · Health</p>",
     unsafe_allow_html=True,
 )
-st.markdown(
-    f"<script>setTimeout(()=>window.location.reload(), {REFRESH_MS});</script>",
-    unsafe_allow_html=True,
-)
+st.markdown(f"<script>setTimeout(()=>window.location.reload(), {REFRESH_MS});</script>", unsafe_allow_html=True)
 
-# =================== DB helpers ===================
+# ========= db helpers =========
 def db_conn():
     if not USE_DB: return None
     return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
-# =================== Crypto (CoinGecko) ===================
+# ========= crypto (coingecko) =========
 @st.cache_data(ttl=60)
 def coingecko_series(asset_id: str, days: int):
     url = f"https://api.coingecko.com/api/v3/coins/{asset_id}/market_chart"
@@ -52,7 +49,7 @@ def coingecko_series(asset_id: str, days: int):
     df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms")
     return df[["ts", "price"]]
 
-# =================== Stocks (Finnhub) ===================
+# ========= stocks (finnhub) =========
 @st.cache_data(ttl=30)
 def finnhub_quote(symbol: str):
     if not FINNHUB_KEY: return None
@@ -109,7 +106,7 @@ def finnhub_company_news(symbol: str):
         })
     return out
 
-# =================== Macro (FRED) ===================
+# ========= macro (fred) =========
 @st.cache_data(ttl=3600)
 def fred_series(series_id: str):
     if not FRED_KEY: return None
@@ -132,31 +129,56 @@ def fred_cpi_yoy():
     df["yoy"] = df["value"].pct_change(12) * 100
     return df[["date", "yoy"]].dropna()
 
-# =================== Institutional (flows + SEC) ===================
+# ========= institutional (robust ETF + SEC) =========
 @st.cache_data(ttl=60 * 30)
-def btc_etf_flows_live():
+def btc_etf_flows_safe():
+    """Never crash the UI. Try soup → fallback read_html → else empty list."""
     url = "https://www.farside.co.uk/bitcoin-etf-flows"
     headers = {"User-Agent": f"MarketAI/1.0 ({UA_EMAIL})"}
-    r = httpx.get(url, headers=headers, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    table = soup.find("table")
-    if not table: return None
-    rows = []
-    for tr in table.find_all("tr"):
-        cols = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
-        if len(cols) < 3 or "fund" in cols[0].lower():  # skip header
-            continue
-        rows.append(cols)
-    parsed = []
-    for cols in rows:
+    try:
+        r = httpx.get(url, headers=headers, timeout=20, follow_redirects=True)
+        if r.status_code != 200 or not r.text:
+            return []
+        # First pass: soup
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table")
+        if table:
+            rows = []
+            for tr in table.find_all("tr"):
+                cols = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+                if len(cols) < 3 or "fund" in cols[0].lower():
+                    continue
+                try:
+                    fund, date_s, flow_s = cols[0], cols[1], cols[2]
+                    flow = float(flow_s.replace("$", "").replace("m", "").replace(",", ""))
+                    rows.append({"fund": fund, "date": date_s, "flow_musd": flow})
+                except Exception:
+                    continue
+            if rows:
+                return rows[:60]
+        # Fallback: pandas
         try:
-            fund, date_s, flow_s = cols[0], cols[1], cols[2]
-            flow = float(flow_s.replace("$", "").replace("m", "").replace(",", ""))
-            parsed.append({"fund": fund, "date": date_s, "flow_musd": flow})
+            tables = pd.read_html(r.text)
+            if tables:
+                df = next((t for t in tables if t.shape[1] >= 3), None)
+                if df is not None:
+                    rows = []
+                    for _, rr in df.iloc[:, :3].iterrows():
+                        vals = [str(x) for x in rr.tolist()]
+                        fund, date_s, flow_s = vals[0], vals[1], vals[2]
+                        if "fund" in fund.lower():  # skip headers
+                            continue
+                        try:
+                            flow = float(flow_s.replace("$", "").replace("m", "").replace(",", ""))
+                            rows.append({"fund": fund, "date": date_s, "flow_musd": flow})
+                        except Exception:
+                            continue
+                    return rows[:60]
         except Exception:
-            continue
-    return parsed[:60]
+            pass
+    except Exception:
+        pass
+    return []
 
 @st.cache_data(ttl=60 * 10)
 def sec_search_live(query="bitcoin OR digital asset", forms=("8-K", "13F-HR", "13D", "13G"), size=20):
@@ -166,12 +188,13 @@ def sec_search_live(query="bitcoin OR digital asset", forms=("8-K", "13F-HR", "1
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    form_filters = " OR ".join([f'formType:"{f}"' for f in forms])
-    q = f'({query}) AND ({form_filters})'
+    ff = " OR ".join([f'formType:"{f}"' for f in forms]) if forms else ""
+    q = f'({query}) AND ({ff})' if ff else f'({query})'
     payload = {"keys": q, "category": "custom", "from": 0, "size": size, "sort": [{"filedAt": {"order": "desc"}}]}
     try:
         resp = httpx.post(url, headers=headers, json=payload, timeout=20)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            return []
         hits = resp.json().get("hits", {}).get("hits", [])
         out = []
         for h in hits:
@@ -186,12 +209,12 @@ def sec_search_live(query="bitcoin OR digital asset", forms=("8-K", "13F-HR", "1
             })
         return out
     except Exception:
-        return None
+        return []
 
-# =================== UI ===================
-tab1, tab2, tab3, tab4 = st.tabs(["Crypto", "Stocks & Macro", "AI", "Institutional"])
+# ========= ui =========
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Crypto", "Stocks & Macro", "AI", "Institutional", "Health"])
 
-# ---- Crypto
+# -- Crypto
 with tab1:
     left, right = st.columns([2, 1])
     with left:
@@ -211,7 +234,7 @@ with tab1:
     else:
         st.warning("No data from CoinGecko.")
 
-# ---- Stocks & Macro
+# -- Stocks & Macro
 with tab2:
     st.subheader("Stocks")
     tick = st.text_input("Ticker (e.g., SPY, AAPL, TSLA)", value="SPY").upper().strip()
@@ -254,7 +277,7 @@ with tab2:
         st.line_chart(dgs10.tail(180).set_index("date")["value"])
         st.caption("10Y Treasury yield (last ~6 months)")
 
-# ---- AI
+# -- AI
 with tab3:
     if OPENAI_KEY:
         try:
@@ -277,10 +300,10 @@ with tab3:
     else:
         st.caption("Tip: add OPENAI_API_KEY in Variables to enable AI summaries.")
 
-# ---- Institutional
+# -- Institutional
 with tab4:
     st.subheader("BTC Spot ETF flows (daily)")
-    # DB view (persisted by worker)
+    # DB view (from worker)
     if USE_DB:
         try:
             with db_conn() as cn:
@@ -298,12 +321,14 @@ with tab4:
         except Exception as e:
             st.caption(f"DB read issue: {e}")
 
-    # live fallback
-    live = btc_etf_flows_live()
+    # Live snapshot (safe)
+    live = btc_etf_flows_safe()
     if live:
         st.write("Latest (live):")
         st.dataframe(pd.DataFrame(live).head(15))
-        st.caption("Live source: Farside (cached 30 min)")
+        st.caption("Live source: Farside (cached 30 min).")
+    else:
+        st.caption("Could not fetch the live flows right now (rate limit or site layout change).")
 
     st.markdown("---")
     st.subheader("Recent SEC filings mentioning crypto")
@@ -311,8 +336,8 @@ with tab4:
         try:
             with db_conn() as cn:
                 df_fil = pd.read_sql_query(
-                    "SELECT filed_at, form, company, title, link FROM sec_filings ORDER BY filed_at DESC NULLS LAST LIMIT 25",
-                    cn
+                    "SELECT filed_at, form, company, title, link FROM sec_filings "
+                    "ORDER BY filed_at DESC NULLS LAST LIMIT 25", cn
                 )
             if len(df_fil):
                 for _, r in df_fil.iterrows():
@@ -344,3 +369,51 @@ with tab4:
             st.caption("Live from SEC (cached ~10 min).")
         else:
             st.caption("No results or rate-limited. Try simpler keywords.")
+
+# -- Health
+with tab5:
+    st.subheader("Service Health")
+    col1, col2 = st.columns(2)
+
+    # env presence
+    with col1:
+        st.write("**Environment keys**")
+        st.write(f"- DATABASE_URL: {'✅' if USE_DB else '❌'}")
+        st.write(f"- FINNHUB_KEY: {'✅' if FINNHUB_KEY else '❌'}")
+        st.write(f"- FRED_KEY: {'✅' if FRED_KEY else '❌'}")
+        st.write(f"- OPENAI_API_KEY: {'✅' if OPENAI_KEY else '❌'}")
+        st.write(f"- WEBHOOK_URL: {'✅' if WEBHOOK_URL else '❌'}")
+
+    # db stats
+    with col2:
+        if USE_DB:
+            try:
+                with db_conn() as cn:
+                    bars = pd.read_sql_query("SELECT COUNT(*) n FROM market_bars", cn)["n"].iloc[0]
+                    etf  = pd.read_sql_query("SELECT COUNT(*) n FROM etf_flows", cn)["n"].iloc[0]
+                    sec  = pd.read_sql_query("SELECT COUNT(*) n FROM sec_filings", cn)["n"].iloc[0]
+                    last_alert = pd.read_sql_query(
+                        "SELECT ts, kind FROM alerts ORDER BY ts DESC LIMIT 1", cn
+                    )
+                st.write("**Database rows**")
+                st.write(f"- market_bars: {int(bars)}")
+                st.write(f"- etf_flows: {int(etf)}")
+                st.write(f"- sec_filings: {int(sec)}")
+                if len(last_alert):
+                    st.write(f"- last alert: {last_alert['ts'].iloc[0]} ({last_alert['kind'].iloc[0]})")
+            except Exception as e:
+                st.warning(f"DB check failed: {e}")
+        else:
+            st.caption("No database connected.")
+
+    st.markdown("---")
+    st.subheader("Send test webhook (optional)")
+    if WEBHOOK_URL:
+        if st.button("Send test ping"):
+            try:
+                httpx.post(WEBHOOK_URL, json={"text": "Market AI: test webhook from dashboard"}, timeout=10)
+                st.success("Sent!")
+            except Exception as e:
+                st.error(f"Failed: {e}")
+    else:
+        st.caption("Add WEBHOOK_URL in Variables to enable test pings.")
